@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List
+from typing import Dict, List, Generator
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -54,7 +54,7 @@ AGENT_SYSTEM_PROMPTS = {
 # -----------------------------------------------------------------------------
 
 def call_openai(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
-    """Wrapper around OpenAI chat completions"""
+    """Non-streaming completion used internally when full response is fine."""
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -66,8 +66,25 @@ def call_openai(system_prompt: str, user_prompt: str, temperature: float = 0.3) 
     return response.choices[0].message.content.strip()
 
 
-def run_agent(agent_key: str, topic: str) -> Dict[str, str]:
-    """Execute an agent with a given topic and return its parsed result."""
+def call_openai_stream(system_prompt: str, user_prompt: str, temperature: float = 0.3) -> Generator[str, None, None]:
+    """Yield content chunks from the OpenAI stream."""
+    stream = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        stream=True,
+    )
+
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def run_agent_stream(agent_key: str, topic: str, reasoning_placeholder: st.empty) -> Dict[str, str]:
+    """Execute an agent with streaming, updating the given placeholder live."""
     system_prompt = AGENT_SYSTEM_PROMPTS[agent_key]
     user_prompt = (
         "Evaluate the following thesis topic:\n" + topic + "\n\n"
@@ -76,18 +93,24 @@ def run_agent(agent_key: str, topic: str) -> Dict[str, str]:
         "'final_answer' should contain your concluding recommendation or verdict."
     )
 
-    raw_output = call_openai(system_prompt, user_prompt)
+    collected = ""
+    for token in call_openai_stream(system_prompt, user_prompt):
+        collected += token
+        reasoning_placeholder.markdown(collected + "▌")
 
-    # Attempt to parse JSON. Fallback to treating entire output as one string.
+    # Finished streaming – remove cursor
+    reasoning_placeholder.markdown(collected)
+
+    # Parse JSON if possible
     try:
-        parsed = json.loads(raw_output)
-        thought = parsed.get("thought_process", raw_output)
-        final = parsed.get("final_answer", raw_output)
+        parsed = json.loads(collected)
+        thought = parsed.get("thought_process", collected)
+        final = parsed.get("final_answer", collected)
     except json.JSONDecodeError:
-        thought = raw_output
-        final = raw_output
+        thought = collected
+        final = collected
 
-    return {"thought_process": thought, "final_answer": final, "raw": raw_output}
+    return {"thought_process": thought, "final_answer": final, "raw": collected}
 
 # -----------------------------------------------------------------------------
 # Streamlit UI
@@ -113,8 +136,27 @@ if st.button("Evaluate"):
 
     with st.spinner("Running multi-agent evaluation…"):
         results = {}
+
+        # Pre-create expanders and placeholders so we can update them while streaming
+        agent_placeholders: Dict[str, Dict[str, st.empty]] = {}
+        for label, key in [
+            ("Scope Assessment", "scope"),
+            ("Clarity Critique", "critic"),
+            ("Literature Availability", "literature"),
+            ("Practical Feasibility", "feasibility"),
+        ]:
+            with st.expander(label, expanded=True):
+                reason_ph = st.empty()
+                conclusion_ph = st.empty()
+            agent_placeholders[key] = {"reason": reason_ph, "conclusion": conclusion_ph}
+
+        # Run each agent streamingly
         for key in ["scope", "critic", "literature", "feasibility"]:
-            results[key] = run_agent(key, topic)
+            phs = agent_placeholders[key]
+            results[key] = run_agent_stream(key, topic, phs["reason"])
+            # After completion, fill conclusion
+            phs["reason"].markdown(results[key]["thought_process"])
+            phs["conclusion"].markdown(f"**Conclusion:** {results[key]['final_answer']}")
 
         # Prepare a combined summary for the judge agent
         judge_context_lines = []
@@ -132,20 +174,9 @@ if st.button("Evaluate"):
         except json.JSONDecodeError:
             judge_parsed = {"decision": "UNKNOWN", "justification": judge_raw}
 
-    # Display results in expandable sections
-    st.success("Evaluation complete.")
+    # The expanders are already populated live; no need to re-render here
 
-    for label, key in [
-        ("Scope Assessment", "scope"),
-        ("Clarity Critique", "critic"),
-        ("Literature Availability", "literature"),
-        ("Practical Feasibility", "feasibility"),
-    ]:
-        with st.expander(label, expanded=False):
-            st.subheader("Reasoning")
-            st.markdown(results[key]["thought_process"])
-            st.subheader("Conclusion")
-            st.markdown(results[key]["final_answer"])
+    st.success("Evaluation complete.")
 
     st.markdown("---")
     st.header("🏁 Overall Verdict")
