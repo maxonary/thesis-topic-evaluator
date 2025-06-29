@@ -1,6 +1,7 @@
 import os
 import json
-from typing import Dict, List, Generator
+import re
+from typing import Dict, List, Generator, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -83,6 +84,17 @@ def call_openai_stream(system_prompt: str, user_prompt: str, temperature: float 
             yield chunk.choices[0].delta.content
 
 
+def _extract_json(text: str) -> Optional[dict]:
+    """Attempt to locate and parse the first JSON object in the text."""
+    match = re.search(r"{.*}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def run_agent_stream(agent_key: str, topic: str, reasoning_placeholder: st.empty) -> Dict[str, str]:
     """Execute an agent with streaming, updating the given placeholder live."""
     system_prompt = AGENT_SYSTEM_PROMPTS[agent_key]
@@ -101,14 +113,17 @@ def run_agent_stream(agent_key: str, topic: str, reasoning_placeholder: st.empty
     # Finished streaming – remove cursor
     reasoning_placeholder.markdown(collected)
 
-    # Parse JSON if possible
-    try:
-        parsed = json.loads(collected)
+    # Parse JSON if possible (flexible extraction)
+    parsed = _extract_json(collected)
+    if parsed is not None:
         thought = parsed.get("thought_process", collected)
         final = parsed.get("final_answer", collected)
-    except json.JSONDecodeError:
+    else:
         thought = collected
         final = collected
+
+    if debug_mode:
+        print(f"\n[{agent_key.upper()} RAW OUTPUT]\n{collected}\n")
 
     return {"thought_process": thought, "final_answer": final, "raw": collected}
 
@@ -117,6 +132,9 @@ def run_agent_stream(agent_key: str, topic: str, reasoning_placeholder: st.empty
 # -----------------------------------------------------------------------------
 
 st.set_page_config(page_title="Thesis Topic Evaluator", layout="centered")
+
+# Add debug toggle in sidebar
+debug_mode = st.sidebar.checkbox("🔧 Debug mode (print raw outputs)")
 
 st.title("🎓 Thesis Topic Evaluator")
 
@@ -169,10 +187,15 @@ if st.button("Evaluate"):
             "Respond in JSON with keys: 'decision' and 'justification'."
         )
         judge_raw = call_openai(AGENT_SYSTEM_PROMPTS["judge"], judge_user_prompt, temperature=0.2)
-        try:
-            judge_parsed = json.loads(judge_raw)
-        except json.JSONDecodeError:
-            judge_parsed = {"decision": "UNKNOWN", "justification": judge_raw}
+
+        judge_parsed_obj = _extract_json(judge_raw) or {}
+        judge_parsed = {
+            "decision": judge_parsed_obj.get("decision", "UNKNOWN"),
+            "justification": judge_parsed_obj.get("justification", judge_raw),
+        }
+
+        if debug_mode:
+            print("\n[JUDGE RAW OUTPUT]\n" + judge_raw + "\n")
 
     # The expanders are already populated live; no need to re-render here
 
