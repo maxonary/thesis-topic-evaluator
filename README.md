@@ -12,6 +12,21 @@ A Streamlit web application that leverages the ReAct (Reasoning + Acting) multi-
 
 Each agent operates using an LLM via the OpenAI API, following the ReAct methodology to reason step-by-step before acting.
 
+## Architecture
+
+```mermaid
+graph TD
+    U["User (Streamlit UI)"] --> SCOPE["Scope Agent"]
+    U --> CRITIC["Critic Agent"]
+    U --> LIT["Literature Agent"]
+    U --> FEAS["Feasibility Agent"]
+    SCOPE --> JUDGE["Judge Agent"]
+    CRITIC --> JUDGE
+    LIT --> JUDGE
+    FEAS --> JUDGE
+    JUDGE --> U
+```
+
 ## Setup
 
 1. **Clone & install dependencies**
