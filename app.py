@@ -48,6 +48,10 @@ AGENT_SYSTEM_PROMPTS = {
         "Synthesise their feedback and provide a final overall decision. The decision must be one of: \"APPROVE\", \"RECOMMEND_REFINEMENT\", or \"REJECT\". "
         "Justify briefly (≤120 words) referencing key points from prior agents."
     ),
+    "refiner": (
+        "You are the TOPIC REFINER. Given a Bachelor thesis topic in Software Engineering and the feedback from evaluation agents, you must propose an improved topic that addresses all raised concerns while keeping the original domain intent. "
+        "Respond ONLY with the refined topic sentence – do not include any additional commentary."
+    ),
 }
 
 # -----------------------------------------------------------------------------
@@ -128,6 +132,86 @@ def run_agent_stream(agent_key: str, topic: str, reasoning_placeholder: st.empty
     return {"thought_process": thought, "final_answer": final, "raw": collected}
 
 # -----------------------------------------------------------------------------
+# Non-stream helpers (defined early for linter; full definitions appear later)
+# -----------------------------------------------------------------------------
+
+def run_agent(agent_key: str, topic: str) -> Dict[str, str]:  # noqa: F401
+    """Run agent without streaming, returning parsed content."""
+    system_prompt = AGENT_SYSTEM_PROMPTS[agent_key]
+    user_prompt = (
+        "Evaluate the following thesis topic:\n" + topic + "\n\n"
+        "Respond in JSON with keys: 'thought_process', 'final_answer'. "
+        "'thought_process' should contain your ReAct chain of thought. "
+        "'final_answer' should contain your concluding recommendation or verdict."
+    )
+
+    raw_output = call_openai(system_prompt, user_prompt)
+
+    parsed = _extract_json(raw_output)
+    if parsed is not None:
+        thought = parsed.get("thought_process", raw_output)
+        final = parsed.get("final_answer", raw_output)
+    else:
+        thought = raw_output
+        final = raw_output
+
+    if debug_mode:
+        print(f"\n[{agent_key.upper()} RAW OUTPUT]\n{raw_output}\n")
+
+    return {"thought_process": thought, "final_answer": final, "raw": raw_output}
+
+
+def evaluate_topic(topic: str) -> Dict[str, Dict[str, str]]:  # noqa: F401
+    """Evaluate the topic with all specialised agents and judge."""
+    results: Dict[str, Dict[str, str]] = {}
+    for key in ["scope", "critic", "literature", "feasibility"]:
+        results[key] = run_agent(key, topic)
+
+    judge_context_lines = [f"{k.upper()} AGENT SAID:\n{v['raw']}" for k, v in results.items()]
+    judge_input = "\n\n".join(judge_context_lines)
+
+    judge_prompt = (
+        "You are given the following agent outputs. Provide your synthesised verdict as instructed.\n\n" + judge_input + "\n"
+        "Respond in JSON with keys: 'decision' and 'justification'."
+    )
+    judge_raw = call_openai(AGENT_SYSTEM_PROMPTS["judge"], judge_prompt, temperature=0.2)
+
+    judge_parsed_obj = _extract_json(judge_raw) or {}
+    judge_parsed = {
+        "decision": judge_parsed_obj.get("decision", "UNKNOWN"),
+        "justification": judge_parsed_obj.get("justification", judge_raw),
+        "raw": judge_raw,
+    }
+
+    if debug_mode:
+        print("\n[JUDGE RAW OUTPUT]\n" + judge_raw + "\n")
+
+    results["judge"] = judge_parsed
+    return results
+
+
+def refine_topic(original_topic: str, evaluation_results: Dict[str, Dict[str, str]]) -> str:  # noqa: F401
+    """Ask the refiner agent for a better topic."""
+    feedback_lines = []
+    for k in ["scope", "critic", "literature", "feasibility", "judge"]:
+        raw = evaluation_results[k]["raw"]
+        feedback_lines.append(f"{k.upper()} FEEDBACK:\n{raw}")
+
+    refiner_prompt_user = (
+        "Original topic:\n" + original_topic + "\n\n" + "\n\n".join(feedback_lines) + "\n\n"
+        "Provide ONLY one improved topic that addresses all concerns."
+    )
+
+    refined_topic = call_openai(AGENT_SYSTEM_PROMPTS["refiner"], refiner_prompt_user, temperature=0.4)
+
+    refined_topic = refined_topic.strip().split("\n")[0]
+
+    if debug_mode:
+        print("\n[REFINER OUTPUT]\n" + refined_topic + "\n")
+
+    return refined_topic
+
+# -----------------------------------------------------------------------------
 # Streamlit UI
 # -----------------------------------------------------------------------------
 
@@ -145,15 +229,23 @@ The system uses specialised agents (ReAct) to evaluate **scope**, **clarity**, *
     """
 )
 
+# Input controls ----------------------------------------------------------------
+
 topic = st.text_area("Proposed Thesis Topic", height=150, placeholder="e.g. Employing Machine Learning for Automated Code Review in Continuous Integration Pipelines")
 
-if st.button("Evaluate"):
+auto_iterate = st.checkbox("🔄 Automatically refine until approved (max 3 iterations)")
+
+if st.button("Evaluate & Iterate" if auto_iterate else "Evaluate"):
     if not topic.strip():
         st.warning("Please input a thesis topic.")
         st.stop()
 
-    with st.spinner("Running multi-agent evaluation…"):
+    with st.spinner("Running evaluation…"):
         results = {}
+
+        # ----------- FIRST ITERATION (with streaming) -------------------------
+        st.subheader("Iteration 1: Original Topic")
+        st.markdown(f"**Topic:** _{topic}_")
 
         # Pre-create expanders and placeholders so we can update them while streaming
         agent_placeholders: Dict[str, Dict[str, st.empty]] = {}
@@ -176,10 +268,8 @@ if st.button("Evaluate"):
             phs["reason"].markdown(results[key]["thought_process"])
             phs["conclusion"].markdown(f"**Conclusion:** {results[key]['final_answer']}")
 
-        # Prepare a combined summary for the judge agent
-        judge_context_lines = []
-        for k, v in results.items():
-            judge_context_lines.append(f"{k.upper()} AGENT SAID:\n{v['raw']}")
+        # Judge evaluation for first iteration (reuse existing logic)
+        judge_context_lines = [f"{k.upper()} AGENT SAID:\n{v['raw']}" for k, v in results.items()]
         judge_input = "\n\n".join(judge_context_lines)
 
         judge_user_prompt = (
@@ -192,6 +282,7 @@ if st.button("Evaluate"):
         judge_parsed = {
             "decision": judge_parsed_obj.get("decision", "UNKNOWN"),
             "justification": judge_parsed_obj.get("justification", judge_raw),
+            "raw": judge_raw,
         }
 
         if debug_mode:
@@ -199,12 +290,76 @@ if st.button("Evaluate"):
 
     # The expanders are already populated live; no need to re-render here
 
-    st.success("Evaluation complete.")
+    st.success("Iteration 1 complete.")
 
-    st.markdown("---")
-    st.header("🏁 Overall Verdict")
-    st.subheader(judge_parsed.get("decision", "UNKNOWN"))
-    st.markdown(judge_parsed.get("justification", ""))
+    current_topic = topic
+    current_results = {**results, "judge": judge_parsed}
+
+    # ------------------- Auto-Refinement Loop ----------------------
+    if auto_iterate:
+        max_iters = 3
+        iter_num = 1
+
+        while iter_num < max_iters and current_results["judge"]["decision"] != "APPROVE":
+            iter_num += 1
+            st.markdown("---")
+            st.subheader(f"Iteration {iter_num}: Refinement")
+
+            # Refine topic
+            current_topic = refine_topic(current_topic, current_results)
+            st.markdown(f"**Proposed topic:** _{current_topic}_")
+
+            # ----------- STREAMING EVALUATION FOR REFINED TOPIC -------------
+            agent_placeholders_ref: Dict[str, Dict[str, st.empty]] = {}
+            for label, key in [
+                ("Scope Assessment", "scope"),
+                ("Clarity Critique", "critic"),
+                ("Literature Availability", "literature"),
+                ("Practical Feasibility", "feasibility"),
+            ]:
+                with st.expander(label, expanded=True):
+                    reason_ph = st.empty()
+                    conclusion_ph = st.empty()
+                agent_placeholders_ref[key] = {"reason": reason_ph, "conclusion": conclusion_ph}
+
+            # Run agents with streaming
+            current_results = {}
+            for key in ["scope", "critic", "literature", "feasibility"]:
+                phs = agent_placeholders_ref[key]
+                current_results[key] = run_agent_stream(key, current_topic, phs["reason"])
+                phs["reason"].markdown(current_results[key]["thought_process"])
+                phs["conclusion"].markdown(f"**Conclusion:** {current_results[key]['final_answer']}")
+
+            # Judge evaluation
+            judge_ctx_lines = [f"{k.upper()} AGENT SAID:\n{v['raw']}" for k, v in current_results.items()]
+            judge_input2 = "\n\n".join(judge_ctx_lines)
+            judge_user_prompt2 = (
+                "You are given the following agent outputs. Provide your synthesised verdict as instructed.\n\n" + judge_input2 + "\n"
+                "Respond in JSON with keys: 'decision' and 'justification'."
+            )
+            judge_raw2 = call_openai(AGENT_SYSTEM_PROMPTS["judge"], judge_user_prompt2, temperature=0.2)
+            judge_obj2 = _extract_json(judge_raw2) or {}
+            current_results["judge"] = {
+                "decision": judge_obj2.get("decision", "UNKNOWN"),
+                "justification": judge_obj2.get("justification", judge_raw2),
+                "raw": judge_raw2,
+            }
+
+            st.markdown(f"### Verdict: {current_results['judge']['decision']}")
+            st.markdown(current_results["judge"]["justification"])
+
+        st.markdown("---")
+        st.header("🏁 Final Verdict")
+        st.markdown(f"**Final topic:** _{current_topic}_")
+        st.subheader(current_results["judge"]["decision"])
+        st.markdown(current_results["judge"]["justification"])
+
+    else:
+        st.markdown("---")
+        st.header("🏁 Overall Verdict")
+        st.markdown(f"**Topic:** _{topic}_")
+        st.subheader(judge_parsed.get("decision", "UNKNOWN"))
+        st.markdown(judge_parsed.get("justification", ""))
 
 else:
     st.info("Enter a topic and press **Evaluate** to begin.") 
